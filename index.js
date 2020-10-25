@@ -56,6 +56,9 @@ DESCRIPTION
     --noSecurityHotspot
         Set this flag for old versions of sonarQube without security hotspots (<7.3?). Default is false
 
+    --displayKnownRules
+        Set this flag to append a table of all Sonarqubes known rules to the page. Default is false
+
     --help
         display this help message`);
   process.exit();
@@ -82,6 +85,7 @@ const data = {
   sonarBaseURL: argv.sonarurl.replace(/\/$/, ""),
   sonarOrganization: argv.sonarorganization,
   rules: [],
+  displayKnownRules: (argv.displayKnownRules == 'true' ),
   issues: []
 };
 
@@ -104,7 +108,7 @@ else{
   // For newer versions of sonar, rules and issues may be of type VULNERABILITY or SECURITY_HOTSPOT
   DEFAULT_FILTER="&types=VULNERABILITY,SECURITY_HOTSPOT"
   // the security hotspot adds TO_REVIEW,IN_REVIEW
-  OPEN_STATUSES="OPEN,CONFIRMED,REOPENED,TO_REVIEW,IN_REVIEW"
+  OPEN_STATUSES="OPEN,CONFIRMED,REOPENED"
 }
 
 // filters for getting rules and issues
@@ -185,18 +189,7 @@ if (data.sinceLeakPeriod) {
   let page = 1;
   let nbResults;
   do {
-    /** Get all statuses except "REVIEWED". 
-     * Actions in sonarQube vs status in security hotspot (sonar >= 7): 
-     * - resolve as reviewed
-     *    "resolution": "FIXED"
-     *    "status": "REVIEWED"
-     * - open as vulnerability
-     *    "status": "OPEN"
-     * - set as in review
-     *    "status": "IN_REVIEW"
-     */
     let query = `${sonarBaseURL}/api/issues/search?componentKeys=${sonarComponent}&ps=${pageSize}&p=${page}&statuses=${OPEN_STATUSES}&resolutions=&s=STATUS&asc=no${leakPeriodFilter}${filterIssue}${withOrganization}`
-    //console.log(query)
     const res = request(
       "GET",
       query,
@@ -210,8 +203,6 @@ if (data.sinceLeakPeriod) {
       const message = rule ? rule.name : "/";
       return {
         rule: issue.rule,
-        // For security hotspots, the vulnerabilities show without a severity before they are confirmed
-        // In this case, get the severity from the rule
         severity: (typeof issue.severity !== 'undefined') ? issue.severity : rule.severity,
         status: issue.status,
         // Take only filename with path, without project name
@@ -219,21 +210,62 @@ if (data.sinceLeakPeriod) {
         line: issue.line,
         description: message,
         message: issue.message,
-        key: issue.key
+        key: issue.key,
+        type: issue.type
+      };
+    }));
+  } while (nbResults === pageSize);
+
+  // The new API require that hotspots be queried through a separate endpoint.
+  page = 1;
+  do {
+    let query = `${sonarBaseURL}/api/hotspots/search?projectKey=${sonarComponent}&ps=${pageSize}&p=${page}&status=TO_REVIEW`;
+    
+    const res = request(
+      "GET",
+      query,
+      options
+    );
+    page++;
+    const hsjson = JSON.parse(res.getBody());
+    nbResults = hsjson.hotspots.length;
+    data.issues = data.issues.concat(hsjson.hotspots.map(issue => {
+      const rule = data.rules.find(r=>r.name.toLowerCase().includes( issue.securityCategory ));
+      return {
+        rule: issue.securityCategory,
+        // For security hotspots, the vulnerabilities show without a severity before they are confirmed
+        // In this case, get the severity from the rule
+        severity: `${rule.severity}\nProbability: ${issue.vulnerabilityProbability}`,
+        status: issue.status,
+        // Take only filename with path, without project name
+        component: issue.component.split(':').pop(),
+        line: issue.line,
+        description:  rule ? rule.name : "/",
+        message: issue.message,
+        key: issue.key,
+        type: "SECURITY_HOTSPOT"
       };
     }));
   } while (nbResults === pageSize);
 
   data.issues.sort(function (a, b) {
-    return severity.get(b.severity) - severity.get(a.severity);
+    const sevB = b.severity.match(/^(\w+)\n?/)[1],
+      sevA = a.severity.match(/^(\w+)\n?/)[1];
+    return severity.get(sevB) - severity.get(sevA);
   });
 
-  data.summary = {
-    blocker: data.issues.filter(issue => issue.severity === "BLOCKER").length,
-    critical: data.issues.filter(issue => issue.severity === "CRITICAL").length,
-    major: data.issues.filter(issue => issue.severity === "MAJOR").length,
-    minor: data.issues.filter(issue => issue.severity === "MINOR").length
-  };
+  const issue_types = ["VULNERABILITY","BUG","CODE_SMELL","SECURITY_HOTSPOT"];
+
+  for( let i=0; i<issue_types.length; i++ )
+  {
+    const sumkey = issue_types[i].toLowerCase().replace("_","");
+    data[`${sumkey}summary`] = {
+      blocker: data.issues.filter(issue => issue.type === issue_types[i] && issue.severity.match(/^(\w+)\n?/)[1] === "BLOCKER").length,
+      critical: data.issues.filter(issue => issue.type === issue_types[i] && issue.severity.match(/^(\w+)\n?/)[1] === "CRITICAL").length,
+      major: data.issues.filter(issue => issue.type === issue_types[i] && issue.severity.match(/^(\w+)\n?/)[1] === "MAJOR").length,
+      minor: data.issues.filter(issue => issue.type === issue_types[i] && issue.severity.match(/^(\w+)\n?/)[1] === "MINOR").length
+    };
+  }
 }
 
 ejs.renderFile(`${__dirname}/index.ejs`, data, {}, (err, str) => {
